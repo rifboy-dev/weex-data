@@ -1,167 +1,177 @@
-// server.js
-// WEEX Market Data — REST + MCP
-// Deno Deploy / Deno.serve
-// Public, read-only market data only.
-
 const WEEX_BASE = "https://api-contract.weex.com";
 
 const ALLOWED_INTERVALS = new Set([
-  "1m", "5m", "15m", "30m",
-  "1h", "4h", "12h", "1d", "1w"
+  "1m",
+  "5m",
+  "15m",
+  "30m",
+  "1h",
+  "4h",
+  "12h",
+  "1d",
+  "1w",
 ]);
 
-const CORS_HEADERS = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, OPTIONS",
-  "access-control-allow-headers":
-    "Content-Type, Accept, MCP-Protocol-Version",
-  "access-control-expose-headers": "MCP-Protocol-Version"
-};
-
-function jsonResponse(data, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      ...CORS_HEADERS,
-      ...extraHeaders
-    }
-  });
-}
-
 function normalizeSymbol(symbol = "ONDO") {
-  let clean = symbol
-    .toLowerCase()
+  let clean = String(symbol)
+    .trim()
+    .toUpperCase()
     .replaceAll("-", "")
     .replaceAll("_", "")
     .replaceAll("/", "");
 
-  if (clean.startsWith("cmt")) {
+  // Accept old formats such as:
+  // ONDO
+  // ONDOUSDT
+  // cmt_ondousdt
+  // cmt-ondousdt
+  if (clean.startsWith("CMT")) {
     clean = clean.substring(3);
   }
 
-  if (!clean.endsWith("usdt")) {
-    clean += "usdt";
+  if (!clean.endsWith("USDT")) {
+    clean += "USDT";
   }
 
-  if (!/^[a-z0-9]+usdt$/.test(clean)) {
+  if (!/^[A-Z0-9]+USDT$/.test(clean)) {
     throw new Error(`Invalid symbol: ${symbol}`);
   }
 
-  return `cmt_${clean}`;
+  return clean;
 }
 
 async function fetchWeex(url) {
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json"
-    }
-  });
+  const response = await fetch(url);
 
   const text = await response.text();
 
-  if (!response.ok) {
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch {
     throw new Error(
-      `WEEX API error ${response.status}: ${text.slice(0, 500)}`
+      `WEEX returned non-JSON response (${response.status}): ${text}`
     );
   }
 
-  try {
-    return JSON.parse(text);
-  } catch {
+  if (!response.ok) {
     throw new Error(
-      `WEEX returned invalid JSON: ${text.slice(0, 500)}`
+      `WEEX API error ${response.status}: ${JSON.stringify(data)}`
     );
   }
+
+  return data;
 }
 
 
-// ---------------------------------------------------------
-// WEEX TICKER — proven V2 endpoint
-// ---------------------------------------------------------
+/* ============================================================
+   WEEX TICKER
+   ============================================================ */
 
 async function getWeexTicker(symbolInput) {
   const requestedSymbol = symbolInput || "ONDO";
   const weexSymbol = normalizeSymbol(requestedSymbol);
 
-  const url =
-    `${WEEX_BASE}/capi/v2/market/ticker` +
+  const tickerUrl =
+    `${WEEX_BASE}/capi/v3/market/ticker/24hr` +
     `?symbol=${encodeURIComponent(weexSymbol)}`;
 
-  const data = await fetchWeex(url);
+  const bookTickerUrl =
+    `${WEEX_BASE}/capi/v3/market/ticker/bookTicker` +
+    `?symbol=${encodeURIComponent(weexSymbol)}`;
+
+  // Fetch ticker + bid/ask simultaneously.
+  const [tickerResponse, bookTickerResponse] = await Promise.all([
+    fetchWeex(tickerUrl),
+    fetchWeex(bookTickerUrl),
+  ]);
+
+  // WEEX may return either an object or an array.
+  const ticker = Array.isArray(tickerResponse)
+    ? tickerResponse[0]
+    : tickerResponse;
+
+  const bookTicker = Array.isArray(bookTickerResponse)
+    ? bookTickerResponse[0]
+    : bookTickerResponse;
+
+  if (!ticker || ticker.lastPrice === undefined) {
+    throw new Error(
+      `Unexpected WEEX ticker response: ${JSON.stringify(tickerResponse)}`
+    );
+  }
 
   return {
     source: "WEEX",
     market: "USDT perpetual",
 
-    requestedSymbol: requestedSymbol.toUpperCase(),
+    requestedSymbol: String(requestedSymbol).toUpperCase(),
+
     weexSymbol,
 
     retrievedAt: new Date().toISOString(),
 
-    last: data.last,
-    markPrice: data.markPrice,
-    indexPrice: data.indexPrice,
+    // Current traded price
+    last: ticker.lastPrice,
 
-    bid: data.best_bid,
-    ask: data.best_ask,
+    // WEEX mark/index prices
+    markPrice: ticker.markPrice,
+    indexPrice: ticker.indexPrice,
 
-    high24h: data.high_24h,
-    low24h: data.low_24h,
-    change24h: data.priceChangePercent,
+    // Order book
+    bid: bookTicker?.bidPrice,
+    ask: bookTicker?.askPrice,
 
-    volume24h: data.volume_24h,
-    exchangeTimestamp: data.timestamp
+    // 24h statistics
+    high24h: ticker.highPrice,
+    low24h: ticker.lowPrice,
+    change24h: ticker.priceChangePercent,
+    volume24h: ticker.volume,
+
+    exchangeTimestamp: ticker.closeTime,
   };
 }
 
 
-// ---------------------------------------------------------
-// WEEX CANDLES — proven V2 endpoint
-// ---------------------------------------------------------
+/* ============================================================
+   WEEX CANDLES
+   ============================================================ */
 
 async function getWeexCandles(
   symbolInput,
-  intervalInput = "4h",
-  limitInput = 100
+  interval = "4h",
+  limit = 100
 ) {
   const requestedSymbol = symbolInput || "ONDO";
   const weexSymbol = normalizeSymbol(requestedSymbol);
 
-  const interval = intervalInput || "4h";
-
   if (!ALLOWED_INTERVALS.has(interval)) {
     throw new Error(
-      `Invalid interval. Supported intervals: ${
-        [...ALLOWED_INTERVALS].join(", ")
-      }`
+      `Invalid interval: ${interval}. Allowed: ${[
+        ...ALLOWED_INTERVALS,
+      ].join(", ")}`
     );
   }
 
-  const parsedLimit = Number(limitInput);
+  limit = Number(limit);
 
-  if (!Number.isInteger(parsedLimit)) {
-    throw new Error("limit must be an integer");
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    throw new Error("limit must be an integer between 1 and 500");
   }
 
-  // Keep the same limit used by our proven REST bridge.
-  const limit = Math.min(
-    Math.max(parsedLimit || 100, 1),
-    500
-  );
-
   const url =
-    `${WEEX_BASE}/capi/v2/market/candles` +
+    `${WEEX_BASE}/capi/v3/market/klines` +
     `?symbol=${encodeURIComponent(weexSymbol)}` +
-    `&granularity=${encodeURIComponent(interval)}` +
-    `&limit=${limit}` +
-    `&priceType=LAST`;
+    `&interval=${encodeURIComponent(interval)}` +
+    `&limit=${limit}`;
 
   const raw = await fetchWeex(url);
 
   if (!Array.isArray(raw)) {
-    throw new Error("Unexpected WEEX candle response");
+    throw new Error(
+      `Unexpected WEEX candle response: ${JSON.stringify(raw)}`
+    );
   }
 
   const candles = raw.map((c) => ({
@@ -174,570 +184,425 @@ async function getWeexCandles(
     close: Number(c[4]),
 
     volumeBase: Number(c[5]),
-    volumeQuote: Number(c[6])
+
+    closeTime: Number(c[6]),
+
+    volumeQuote: Number(c[7]),
   }));
 
   return {
     source: "WEEX",
     market: "USDT perpetual",
 
-    requestedSymbol: requestedSymbol.toUpperCase(),
+    requestedSymbol: String(requestedSymbol).toUpperCase(),
+
     weexSymbol,
 
     interval,
-    count: candles.length,
+
+    limit: candles.length,
 
     retrievedAt: new Date().toISOString(),
 
-    candles
+    candles,
   };
 }
 
 
-// ---------------------------------------------------------
-// MCP TOOL DEFINITIONS
-// ---------------------------------------------------------
+/* ============================================================
+   MCP HELPERS
+   ============================================================ */
 
-const MCP_TOOLS = [
-  {
-    name: "get_weex_ticker",
-    title: "Get WEEX Futures Ticker",
-
-    description:
-      "Get live public WEEX USDT perpetual futures ticker data. " +
-      "Returns last price, mark price, index price, bid, ask, " +
-      "24h high/low, 24h percentage change and volume. Read-only.",
-
-    inputSchema: {
-      type: "object",
-
-      properties: {
-        symbol: {
-          type: "string",
-          description:
-            "Cryptocurrency symbol, for example ONDO, HBAR, SUI or BTC."
-        }
-      },
-
-      required: ["symbol"],
-      additionalProperties: false
-    },
-
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: true
-    }
-  },
-
-  {
-    name: "get_weex_candles",
-    title: "Get WEEX Futures Candles",
-
-    description:
-      "Get public OHLCV candlestick data from the WEEX " +
-      "USDT perpetual futures market. Read-only.",
-
-    inputSchema: {
-      type: "object",
-
-      properties: {
-        symbol: {
-          type: "string",
-          description:
-            "Cryptocurrency symbol, for example ONDO, HBAR, SUI or BTC."
-        },
-
-        interval: {
-          type: "string",
-
-          enum: [
-            "1m", "5m", "15m", "30m",
-            "1h", "4h", "12h", "1d", "1w"
-          ],
-
-          description: "Candlestick interval."
-        },
-
-        limit: {
-          type: "integer",
-          minimum: 1,
-          maximum: 500,
-          default: 100,
-
-          description:
-            "Number of candles to return. Maximum 500."
-        }
-      },
-
-      required: ["symbol", "interval"],
-      additionalProperties: false
-    },
-
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: true
-    }
-  }
-];
-
-
-// ---------------------------------------------------------
-// MCP JSON-RPC HELPERS
-// ---------------------------------------------------------
-
-function mcpResult(id, result) {
+function jsonRpcResult(id, result) {
   return {
     jsonrpc: "2.0",
     id,
-    result
+    result,
   };
 }
 
-function mcpError(id, code, message) {
+function jsonRpcError(id, code, message) {
   return {
     jsonrpc: "2.0",
-    id: id ?? null,
-
+    id,
     error: {
       code,
-      message
-    }
+      message,
+    },
   };
 }
 
 
-// ---------------------------------------------------------
-// EXECUTE MCP TOOLS
-// ---------------------------------------------------------
+/* ============================================================
+   MCP SERVER
+   ============================================================ */
 
-async function executeMcpTool(name, args = {}) {
-
-  if (name === "get_weex_ticker") {
-
-    const data =
-      await getWeexTicker(args.symbol);
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ],
-
-      structuredContent: data,
-      isError: false
-    };
-  }
-
-
-  if (name === "get_weex_candles") {
-
-    const data =
-      await getWeexCandles(
-        args.symbol,
-        args.interval,
-        args.limit ?? 100
-      );
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ],
-
-      structuredContent: data,
-      isError: false
-    };
-  }
-
-
-  throw new Error(`Unknown tool: ${name}`);
+function mcpResponse(body) {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
 }
 
 
-// ---------------------------------------------------------
-// MCP ENDPOINT
-// ---------------------------------------------------------
+/* ============================================================
+   DENO HTTP SERVER
+   ============================================================ */
 
-async function handleMcpRequest(request) {
+Deno.serve(async (req) => {
+  const url = new URL(req.url);
 
-  if (request.method !== "POST") {
+  /* ------------------------------------------------------------
+     HOME
+     ------------------------------------------------------------ */
 
-    return jsonResponse(
-      mcpError(
+  if (req.method === "GET" && url.pathname === "/") {
+    return new Response(
+      JSON.stringify(
+        {
+          status: "ok",
+          service: "WEEX Market Data",
+          version: "3",
+          endpoints: {
+            ticker: "/ticker?symbol=ONDO",
+            candles: "/candles?symbol=ONDO&interval=4h&limit=100",
+            mcp: "/mcp",
+          },
+        },
         null,
-        -32600,
-        "MCP endpoint accepts POST requests"
+        2
       ),
-      405,
       {
-        Allow: "POST, OPTIONS"
+        headers: {
+          "Content-Type": "application/json",
+        },
       }
     );
   }
 
 
-  let body;
+  /* ------------------------------------------------------------
+     REST TICKER
+     ------------------------------------------------------------ */
 
-  try {
+  if (req.method === "GET" && url.pathname === "/ticker") {
+    try {
+      const symbol = url.searchParams.get("symbol") || "ONDO";
 
-    body = await request.json();
+      const result = await getWeexTicker(symbol);
 
-  } catch {
-
-    return jsonResponse(
-      mcpError(null, -32700, "Parse error"),
-      400
-    );
+      return new Response(JSON.stringify(result, null, 2), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+    } catch (error) {
+      return new Response(
+        JSON.stringify(
+          {
+            error: "Server error",
+            message: error.message,
+          },
+          null,
+          2
+        ),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }
   }
 
 
-  if (
-    !body ||
-    typeof body !== "object" ||
-    Array.isArray(body) ||
-    body.jsonrpc !== "2.0"
-  ) {
+  /* ------------------------------------------------------------
+     REST CANDLES
+     ------------------------------------------------------------ */
 
-    return jsonResponse(
-      mcpError(
-        body?.id ?? null,
-        -32600,
-        "Invalid Request"
-      ),
-      400
-    );
+  if (req.method === "GET" && url.pathname === "/candles") {
+    try {
+      const symbol = url.searchParams.get("symbol") || "ONDO";
+      const interval = url.searchParams.get("interval") || "4h";
+      const limit = url.searchParams.get("limit") || "100";
+
+      const result = await getWeexCandles(
+        symbol,
+        interval,
+        Number(limit)
+      );
+
+      return new Response(JSON.stringify(result, null, 2), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+    } catch (error) {
+      return new Response(
+        JSON.stringify(
+          {
+            error: "Server error",
+            message: error.message,
+          },
+          null,
+          2
+        ),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }
   }
 
 
-  // MCP notifications do not require a response body.
-  if (body.id === undefined) {
+  /* ------------------------------------------------------------
+     MCP
+     ------------------------------------------------------------ */
 
-    return new Response(null, {
-      status: 202,
-      headers: CORS_HEADERS
-    });
-  }
+  if (url.pathname === "/mcp") {
+    if (req.method !== "POST") {
+      return new Response("Method Not Allowed", {
+        status: 405,
+        headers: {
+          Allow: "POST",
+        },
+      });
+    }
 
+    try {
+      const body = await req.json();
 
-  const id = body.id;
-  const method = body.method;
+      const id = body.id;
 
+      /* --------------------------------------------------------
+         initialize
+         -------------------------------------------------------- */
 
-  try {
-
-    switch (method) {
-
-      case "initialize":
-
-        return jsonResponse(
-          mcpResult(id, {
-
+      if (body.method === "initialize") {
+        return mcpResponse(
+          jsonRpcResult(id, {
             protocolVersion: "2025-06-18",
 
             capabilities: {
-              tools: {
-                listChanged: false
-              }
+              tools: {},
             },
 
             serverInfo: {
-              name: "weex-market-data",
-              title: "WEEX Market Data",
-              version: "1.0.0"
+              name: "WEEX Market Data",
+              version: "1.0.0",
             },
-
-            instructions:
-              "Read-only WEEX USDT perpetual futures market data. " +
-              "This server exposes ticker and OHLCV candle retrieval only. " +
-              "It cannot place orders, access accounts or execute trades."
-          }),
-          200,
-          {
-            "MCP-Protocol-Version": "2025-06-18"
-          }
+          })
         );
+      }
 
 
-      case "ping":
+      /* --------------------------------------------------------
+         notifications/initialized
+         -------------------------------------------------------- */
 
-        return jsonResponse(
-          mcpResult(id, {}),
-          200,
-          {
-            "MCP-Protocol-Version": "2025-06-18"
-          }
+      if (body.method === "notifications/initialized") {
+        return new Response(null, {
+          status: 202,
+        });
+      }
+
+
+      /* --------------------------------------------------------
+         tools/list
+         -------------------------------------------------------- */
+
+      if (body.method === "tools/list") {
+        return mcpResponse(
+          jsonRpcResult(id, {
+            tools: [
+              {
+                name: "get_weex_ticker",
+
+                description:
+                  "Get the current live WEEX futures ticker for a symbol.",
+
+                inputSchema: {
+                  type: "object",
+
+                  properties: {
+                    symbol: {
+                      type: "string",
+                      description:
+                        "Trading symbol, for example ONDO, HBAR, SUI or 1000PEPE.",
+                    },
+                  },
+
+                  required: ["symbol"],
+                },
+              },
+
+              {
+                name: "get_weex_candles",
+
+                description:
+                  "Get live OHLCV candles from WEEX futures.",
+
+                inputSchema: {
+                  type: "object",
+
+                  properties: {
+                    symbol: {
+                      type: "string",
+                      description:
+                        "Trading symbol, for example ONDO, HBAR, SUI or 1000PEPE.",
+                    },
+
+                    interval: {
+                      type: "string",
+                      enum: [
+                        "1m",
+                        "5m",
+                        "15m",
+                        "30m",
+                        "1h",
+                        "4h",
+                        "12h",
+                        "1d",
+                        "1w",
+                      ],
+
+                      description: "Candle interval.",
+                    },
+
+                    limit: {
+                      type: "integer",
+                      minimum: 1,
+                      maximum: 500,
+
+                      description:
+                        "Number of candles to return.",
+                    },
+                  },
+
+                  required: ["symbol", "interval"],
+                },
+              },
+            ],
+          })
         );
+      }
 
 
-      case "tools/list":
+      /* --------------------------------------------------------
+         tools/call
+         -------------------------------------------------------- */
 
-        return jsonResponse(
-          mcpResult(id, {
-            tools: MCP_TOOLS
-          }),
-          200,
-          {
-            "MCP-Protocol-Version": "2025-06-18"
-          }
-        );
-
-
-      case "tools/call": {
-
-        const name = body.params?.name;
-        const args =
-          body.params?.arguments ?? {};
-
-
-        if (
-          name !== "get_weex_ticker" &&
-          name !== "get_weex_candles"
-        ) {
-
-          return jsonResponse(
-            mcpError(
-              id,
-              -32602,
-              `Unknown tool: ${name}`
-            ),
-            200
-          );
-        }
-
+      if (body.method === "tools/call") {
+        const toolName = body.params?.name;
+        const args = body.params?.arguments || {};
 
         try {
+          /* ----------------------------------------------------
+             get_weex_ticker
+             ---------------------------------------------------- */
 
-          const result =
-            await executeMcpTool(
-              name,
-              args
+          if (toolName === "get_weex_ticker") {
+            const result = await getWeexTicker(args.symbol);
+
+            return mcpResponse(
+              jsonRpcResult(id, {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(result, null, 2),
+                  },
+                ],
+              })
+            );
+          }
+
+
+          /* ----------------------------------------------------
+             get_weex_candles
+             ---------------------------------------------------- */
+
+          if (toolName === "get_weex_candles") {
+            const result = await getWeexCandles(
+              args.symbol,
+              args.interval || "4h",
+              args.limit || 100
             );
 
+            return mcpResponse(
+              jsonRpcResult(id, {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(result, null, 2),
+                  },
+                ],
+              })
+            );
+          }
 
-          return jsonResponse(
-            mcpResult(
+
+          return mcpResponse(
+            jsonRpcError(
               id,
-              result
-            ),
-            200,
-            {
-              "MCP-Protocol-Version":
-                "2025-06-18"
-            }
+              -32601,
+              `Unknown tool: ${toolName}`
+            )
           );
-
-
         } catch (error) {
-
-          return jsonResponse(
-            mcpResult(id, {
-
-              content: [
-                {
-                  type: "text",
-                  text:
-                    `WEEX tool error: ${
-                      error instanceof Error
-                        ? error.message
-                        : String(error)
-                    }`
-                }
-              ],
-
-              isError: true
-            }),
-            200,
-            {
-              "MCP-Protocol-Version":
-                "2025-06-18"
-            }
+          return mcpResponse(
+            jsonRpcError(
+              id,
+              -32000,
+              error.message
+            )
           );
         }
       }
 
 
-      default:
+      /* --------------------------------------------------------
+         ping
+         -------------------------------------------------------- */
 
-        return jsonResponse(
-          mcpError(
-            id,
-            -32601,
-            `Method not found: ${method}`
-          ),
-          200
+      if (body.method === "ping") {
+        return mcpResponse(
+          jsonRpcResult(id, {})
         );
-    }
-
-  } catch (error) {
-
-    return jsonResponse(
-      mcpError(
-        id,
-        -32603,
-        error instanceof Error
-          ? error.message
-          : String(error)
-      ),
-      500
-    );
-  }
-}
+      }
 
 
-// ---------------------------------------------------------
-// DENO HTTP SERVER
-// ---------------------------------------------------------
-
-Deno.serve(async (request) => {
-
-  const url = new URL(request.url);
-
-
-  // CORS
-  if (request.method === "OPTIONS") {
-
-    return new Response(null, {
-      status: 204,
-      headers: CORS_HEADERS
-    });
-  }
-
-
-  // MCP
-  if (url.pathname === "/mcp") {
-
-    return await handleMcpRequest(
-      request
-    );
-  }
-
-
-  // Existing REST ticker
-  if (
-    request.method === "GET" &&
-    url.pathname === "/ticker"
-  ) {
-
-    try {
-
-      const symbol =
-        url.searchParams.get("symbol") ||
-        "ONDO";
-
-      const data =
-        await getWeexTicker(symbol);
-
-      return jsonResponse(data);
-
+      return mcpResponse(
+        jsonRpcError(
+          id,
+          -32601,
+          `Method not found: ${body.method}`
+        )
+      );
     } catch (error) {
-
-      return jsonResponse(
-        {
-          error: "Server error",
-          message:
-            error instanceof Error
-              ? error.message
-              : String(error)
-        },
-        500
+      return mcpResponse(
+        jsonRpcError(
+          null,
+          -32700,
+          error.message
+        )
       );
     }
   }
 
 
-  // Existing REST candles
-  if (
-    request.method === "GET" &&
-    url.pathname === "/candles"
-  ) {
+  /* ------------------------------------------------------------
+     404
+     ------------------------------------------------------------ */
 
-    try {
-
-      const symbol =
-        url.searchParams.get("symbol") ||
-        "ONDO";
-
-      const interval =
-        url.searchParams.get("interval") ||
-        "4h";
-
-      const limit =
-        Number(
-          url.searchParams.get("limit") ||
-          "100"
-        );
-
-      const data =
-        await getWeexCandles(
-          symbol,
-          interval,
-          limit
-        );
-
-      return jsonResponse(data);
-
-    } catch (error) {
-
-      return jsonResponse(
-        {
-          error: "Server error",
-          message:
-            error instanceof Error
-              ? error.message
-              : String(error)
-        },
-        500
-      );
-    }
-  }
-
-
-  // Homepage / health check
-  if (
-    request.method === "GET" &&
-    url.pathname === "/"
-  ) {
-
-    return jsonResponse({
-
-      status: "ok",
-
-      service:
-        "WEEX Market Data",
-
-      readOnly: true,
-
-      endpoints: {
-        ticker:
-          "/ticker?symbol=ONDO",
-
-        candles:
-          "/candles?symbol=ONDO&interval=4h&limit=20",
-
-        mcp:
-          "/mcp"
-      },
-
-      mcpTools: [
-        "get_weex_ticker",
-        "get_weex_candles"
-      ]
-    });
-  }
-
-
-  return jsonResponse(
-    {
-      error: "Not found"
-    },
-    404
-  );
+  return new Response("Not Found", {
+    status: 404,
+  });
 });
